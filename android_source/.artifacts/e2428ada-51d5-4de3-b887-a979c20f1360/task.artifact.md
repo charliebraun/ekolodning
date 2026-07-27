@@ -1,0 +1,9 @@
+- [ ] Add CameraX dependencies to `libs.versions.toml`
+- [ ] Add CameraX dependencies to `app/build.gradle.kts`
+- [ ] Update `AndroidManifest.xml` with Camera and Audio permissions
+- [ ] Add `PreviewView` to `activity_main.xml`
+- [ ] Update `MainActivity.kt` to handle video recording
+    - [ ] Update permissions check and request
+    - [ ] Initialize CameraX and Preview
+    - [ ] Implement video recording start/stop in synchronization with GPS
+- [ ] Verify build and functionality

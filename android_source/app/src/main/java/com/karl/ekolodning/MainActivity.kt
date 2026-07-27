@@ -12,8 +12,22 @@ import android.util.Log
 import android.widget.Button
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.Preview
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.video.MediaStoreOutputOptions
+import androidx.camera.video.Quality
+import androidx.camera.video.QualitySelector
+import androidx.camera.video.Recorder
+import androidx.camera.video.Recording
+import androidx.camera.video.VideoCapture
+import androidx.camera.video.VideoRecordEvent
+import androidx.camera.video.FileOutputOptions
+import androidx.camera.view.PreviewView
 import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import com.google.android.gms.location.FusedLocationProviderClient
 import com.google.android.gms.location.LocationCallback
 import com.google.android.gms.location.LocationRequest
@@ -34,6 +48,7 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var logTextView: TextView
     private lateinit var logScrollView: ScrollView
+    private lateinit var viewFinder: PreviewView
 
     private var logUri: Uri? = null
     private var logFile: File? = null
@@ -41,14 +56,24 @@ class MainActivity : AppCompatActivity() {
 
     private var loggingActive = false
 
+    private var videoCapture: VideoCapture<Recorder>? = null
+    private var recording: Recording? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
         logTextView = findViewById(R.id.logTextView)
         logScrollView = findViewById(R.id.logScrollView)
+        viewFinder = findViewById(R.id.viewFinder)
 
         fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
+
+        if (checkPermissions()) {
+            startCamera()
+        } else {
+            requestPermissions()
+        }
 
         findViewById<Button>(R.id.startButton).setOnClickListener {
             startLogging()
@@ -69,64 +94,204 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startLogging() {
-        if (loggingActive) return
+        Log.d("GPS_LOGGER", "startLogging called")
+        if (loggingActive) {
+            Log.d("GPS_LOGGER", "Logging already active")
+            return
+        }
 
         if (!checkPermissions()) {
+            Log.d("GPS_LOGGER", "Permissions not granted, requesting")
             requestPermissions()
+            return
+        }
+
+        if (videoCapture == null) {
+            val errorMsg = "VideoCapture is not initialized"
+            Log.e("GPS_LOGGER", errorMsg)
+            Toast.makeText(this@MainActivity, errorMsg, Toast.LENGTH_SHORT).show()
+            appendToLogView("$errorMsg\n")
             return
         }
 
         try {
             val formatter = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault())
-            val filename = "series_${formatter.format(Date())}.log"
+            val baseName = "series_${formatter.format(Date())}"
+            val logFilename = "$baseName.log"
+            val videoFilename = "$baseName.mp4"
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val values = ContentValues().apply {
-                    put(MediaStore.MediaColumns.DISPLAY_NAME, filename)
+                // Log File Setup
+                val logValues = ContentValues().apply {
+                    put(MediaStore.MediaColumns.DISPLAY_NAME, logFilename)
                     put(MediaStore.MediaColumns.MIME_TYPE, "text/plain")
                     put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOCUMENTS)
                 }
                 val collection = MediaStore.Files.getContentUri("external")
-                logUri = this@MainActivity.contentResolver.insert(collection, values)
+                logUri = this@MainActivity.contentResolver.insert(collection, logValues)
                 outputStream = logUri?.let { this@MainActivity.contentResolver.openOutputStream(it, "wa") }
+                Log.d("GPS_LOGGER", "Log file URI: $logUri")
+
+                // Video File Setup
+                val videoValues = ContentValues().apply {
+                    put(MediaStore.Video.Media.DISPLAY_NAME, videoFilename)
+                    put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                    put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES)
+                }
+                val mediaStoreOutputOptions = MediaStoreOutputOptions
+                    .Builder(contentResolver, MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
+                    .setContentValues(videoValues)
+                    .build()
+
+                recording = videoCapture?.output
+                    ?.prepareRecording(this, mediaStoreOutputOptions)
+                    ?.apply {
+                        if (ActivityCompat.checkSelfPermission(
+                                this@MainActivity,
+                                Manifest.permission.RECORD_AUDIO
+                            ) == PackageManager.PERMISSION_GRANTED
+                        ) withAudioEnabled()
+                    }
+                    ?.start(ContextCompat.getMainExecutor(this)) { recordEvent ->
+                        handleVideoEvent(recordEvent)
+                    }
+                Log.d("GPS_LOGGER", "Recording started with MediaStoreOutputOptions")
+
             } else {
-                val docsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
-                if (!docsDir.exists()) docsDir.mkdirs()
-                logFile = File(docsDir, filename)
+                val docsDir =
+                    Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
+                if (!docsDir.exists()) {
+                    val created = docsDir.mkdirs()
+                    Log.d("GPS_LOGGER", "Created directory $docsDir: $created")
+                }
+
+                logFile = File(docsDir, logFilename)
                 outputStream = FileOutputStream(logFile, true)
+                Log.d("GPS_LOGGER", "Log file path: ${logFile?.absolutePath}")
+
+                val videoFile = File(docsDir, videoFilename)
+                val fileOutputOptions = FileOutputOptions.Builder(videoFile).build()
+
+                recording = videoCapture?.output
+                    ?.prepareRecording(this, fileOutputOptions)
+                    ?.apply {
+                        if (ActivityCompat.checkSelfPermission(
+                                this@MainActivity,
+                                Manifest.permission.RECORD_AUDIO
+                            ) == PackageManager.PERMISSION_GRANTED
+                        ) withAudioEnabled()
+                    }
+                    ?.start(ContextCompat.getMainExecutor(this)) { recordEvent ->
+                        handleVideoEvent(recordEvent)
+                    }
+                Log.d("GPS_LOGGER", "Recording started with FileOutputOptions")
             }
 
             val startMsg = "GPS series started: ${Date()}\n"
             writeToStream(startMsg)
-            
+
             logTextView.text = "" // Clear previous logs
             appendToLogView(startMsg)
 
             loggingActive = true
             startGps()
-            
+            Toast.makeText(this@MainActivity, "Recording started", Toast.LENGTH_SHORT).show()
+
         } catch (e: Exception) {
             Log.e("GPS_LOGGER", "Error starting log", e)
             appendToLogView("Error starting log: ${e.message}\n")
+            Toast.makeText(this@MainActivity, "Failed to start recording", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun handleVideoEvent(recordEvent: VideoRecordEvent) {
+        Log.d("GPS_LOGGER", "handleVideoEvent: $recordEvent")
+        when (recordEvent) {
+            is VideoRecordEvent.Start -> {
+                Log.d("GPS_LOGGER", "Video recording started event received")
+            }
+            is VideoRecordEvent.Finalize -> {
+                if (!recordEvent.hasError()) {
+                    val msg = "Video saved to: ${recordEvent.outputResults.outputUri}\n"
+                    Log.d("GPS_LOGGER", msg)
+                    appendToLogView(msg)
+                    Toast.makeText(this@MainActivity, "Video saved successfully", Toast.LENGTH_SHORT).show()
+                } else {
+                    recording?.close()
+                    recording = null
+                    val errorMsg = "Video recording error: ${recordEvent.error}"
+                    Log.e("GPS_LOGGER", errorMsg)
+                    appendToLogView("$errorMsg\n")
+                    Toast.makeText(this@MainActivity, "Video recording failed", Toast.LENGTH_SHORT).show()
+                }
+            }
         }
     }
 
     private fun checkPermissions(): Boolean {
         val fineLocation = ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        val camera = ActivityCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+        val audio = ActivityCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
         val storage = if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
             ActivityCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
         } else {
             true
         }
-        return fineLocation && storage
+        return fineLocation && camera && audio && storage
     }
 
     private fun requestPermissions() {
-        val permissions = mutableListOf(Manifest.permission.ACCESS_FINE_LOCATION)
+        val permissions = mutableListOf(
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.CAMERA,
+            Manifest.permission.RECORD_AUDIO
+        )
         if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
             permissions.add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
         }
         ActivityCompat.requestPermissions(this, permissions.toTypedArray(), 100)
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 100) {
+            if (checkPermissions()) {
+                startCamera()
+            } else {
+                appendToLogView("Permissions not granted. App may not function correctly.\n")
+            }
+        }
+    }
+
+    private fun startCamera() {
+        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
+
+        cameraProviderFuture.addListener({
+            val cameraProvider: ProcessCameraProvider = cameraProviderFuture.get()
+
+            val preview = Preview.Builder()
+                .build()
+                .also {
+                    it.surfaceProvider = viewFinder.surfaceProvider
+                }
+
+            val recorder = Recorder.Builder()
+                .setQualitySelector(QualitySelector.from(Quality.HIGHEST))
+                .build()
+            videoCapture = VideoCapture.withOutput(recorder)
+
+            val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
+
+            try {
+                cameraProvider.unbindAll()
+                cameraProvider.bindToLifecycle(
+                    this, cameraSelector, preview, videoCapture
+                )
+            } catch (e: Exception) {
+                Log.e("GPS_LOGGER", "Use case binding failed", e)
+            }
+
+        }, ContextCompat.getMainExecutor(this))
     }
 
     private fun startGps() {
@@ -172,16 +337,25 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun stopLogging() {
-        if (!loggingActive) return
+        Log.d("GPS_LOGGER", "stopLogging called")
+        if (!loggingActive) {
+            Log.d("GPS_LOGGER", "Logging not active")
+            return
+        }
         loggingActive = false
 
         if (::locationCallback.isInitialized) {
+            Log.d("GPS_LOGGER", "Removing location updates")
             fusedLocationClient.removeLocationUpdates(locationCallback)
         }
 
         val stopMsg = "GPS series stopped: ${Date()}\n"
         writeToStream(stopMsg)
         appendToLogView(stopMsg)
+
+        Log.d("GPS_LOGGER", "Stopping recording")
+        recording?.stop()
+        recording = null
 
         try {
             outputStream?.close()
@@ -193,6 +367,7 @@ class MainActivity : AppCompatActivity() {
         val path = logFile?.absolutePath ?: logUri?.toString() ?: "unknown"
         Log.d("GPS_LOGGER", "Logging stopped. Saved to: $path")
         appendToLogView("Saved to: $path\n")
+        Toast.makeText(this@MainActivity, "Recording stopped", Toast.LENGTH_SHORT).show()
     }
 
     override fun onDestroy() {
