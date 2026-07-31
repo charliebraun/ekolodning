@@ -1,4 +1,4 @@
-#import cv2
+import cv2
 import numpy as np
 import re
 #import argparse
@@ -17,20 +17,73 @@ import re
 def parse_time(line, time_started):
     m = re.search(r"Time:\s*(\d+):(\d+):(\d+)", line)
     if m:
-        hour, minute, second = map(m, m.groups())
+        hour, minute, second = map(int, m.groups())
+        return 3600*hour+60*minute+second - time_started
+    return -1
        
 
 if __name__ == '__main__':
     time_started = 0
     lines = []
-    with open("series_20260727_162700.log.txt") as f:
+    quitting = False
+    video = cv2.VideoCapture("series_20260729_135913.mp4")
+    with open("series_20260729_135913.log.txt") as f:
         _lines = f.read().split("\n")
         line_zero_parts = _lines[0].split(":")
         hour = int(line_zero_parts[1][-2:])
         minute = int(line_zero_parts[2])
         second = int(line_zero_parts[3][:2])
         time_started = 3600*hour+60*minute+second
-        lines = _lines[1:-1]
-    
+        lines = _lines[1:-2]
+    for line in lines[:10]:
+        time_ms = parse_time(line, time_started)*1000
+        video.set(cv2.CAP_PROP_POS_MSEC, time_ms)
+        ret, frame = video.read()
+        if ret:
+            text = ""
+            while True:
+                display = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25).copy()
+                cv2.putText(
+                    display,
+                    f"Label: {text}",
+                    (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1,
+                    (0, 255, 0),
+                    2,
+                )
+                
+                cv2.putText(
+                    display,
+                    "Type digits, Enter=confirm, Backspace=delete, q=quit",
+                    (20, 80),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (255, 255, 255),
+                    2,
+                )
+                
+                cv2.imshow("Frame", display)
+                key = cv2.waitKey(0)
+                
+                if key in (13, 10):
+                    if text:
+                        value = float(text)
+                        print(value)
+                    break
+                elif key in (8, 127):
+                    text = text[:-1]
+                elif ord('0') <= key <= ord('9'):
+                    text += chr(key)
+                elif key == ord('.') and '.' not in text:
+                    text += '.'
+                elif key == ord('q'):
+                    quitting = True
+                    break
+        if quitting == True:
+            break
 
+
+    video.release()
+    cv2.destroyAllWindows()
 
